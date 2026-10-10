@@ -40,6 +40,23 @@ class HeaderModel(BaseModel):
     values: list[str] = Field(alias="X-Values")
 
 
+class PayloadModel(BaseModel):
+    data: dict[str, Any]
+
+
+def _nested_dict(depth: int) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for _ in range(depth):
+        value = {"child": value}
+    return value
+
+
+def _self_referencing_dict() -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    value["self"] = value
+    return value
+
+
 # Fixtures
 @pytest.fixture
 def adapter() -> PydanticAdapter:
@@ -522,6 +539,25 @@ class TestSerialize:
         assert json.loads(content, parse_constant=lambda token: pytest.fail(token)) == (
             {"nested": None} if isinstance(value, dict) else None
         )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(_nested_dict(300), id="nested-dict"),
+            pytest.param([_nested_dict(300)], id="nested-list"),
+            pytest.param(_self_referencing_dict(), id="self-reference"),
+            pytest.param(PayloadModel(data=_nested_dict(300)), id="model"),
+        ],
+    )
+    def test_serialize_unserializable_value_raises_serialization_error(
+        self, adapter: PydanticAdapter, value: object
+    ) -> None:
+        from azure_functions_validation.errors import SerializationError
+
+        with pytest.raises(SerializationError) as exc_info:
+            adapter.serialize(value)
+
+        assert isinstance(exc_info.value.__cause__, ValueError)
 
 
 # Test format_error
