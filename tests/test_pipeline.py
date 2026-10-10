@@ -9,6 +9,7 @@ async handlers, and response model validation — all of which now live in
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
@@ -76,6 +77,11 @@ class SerializationOptionsResponse(BaseModel):
     internal: str = Field(serialization_alias="wireName")
     optional_value: str | None = None
     default_value: str = "default"
+
+
+@dataclass
+class AliasedEnvelope:
+    item: AliasedResponseModel
 
 
 class QueryModel(BaseModel):
@@ -369,6 +375,29 @@ class TestSuccessfulValidation:
         response = handler(mock_request_factory())
 
         assert json.loads(response.get_body()) == {"wireName": None}
+
+    @pytest.mark.parametrize(
+        ("result", "expected"),
+        [
+            ({"item": AliasedResponseModel(internal="value")}, {"item": {"wireName": "value"}}),
+            ([AliasedResponseModel(internal="value")], [{"wireName": "value"}]),
+            (
+                AliasedEnvelope(item=AliasedResponseModel(internal="value")),
+                {"item": {"wireName": "value"}},
+            ),
+        ],
+        ids=["dict", "list", "dataclass"],
+    )
+    def test_direct_return_serializes_nested_model_aliases(
+        self, mock_request_factory: RequestFactory, result: object, expected: object
+    ) -> None:
+        @validate_http()
+        def handler(req: HttpRequest) -> object:
+            return result
+
+        response = handler(mock_request_factory())
+
+        assert json.loads(response.get_body()) == expected
 
     def test_request_inputs_are_parsed_once(self, mock_request_factory: RequestFactory) -> None:
         """Test that configured request inputs are parsed only once."""
