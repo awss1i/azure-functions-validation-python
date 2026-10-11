@@ -1122,7 +1122,7 @@ class TestErrorPathNormalization:
 
         @validate_http(error_formatter=_server_error_formatter)
         def handler(req: HttpRequest) -> dict[str, object]:
-            return _nested_dict(300)
+            return _nested_dict(100_000)
 
         response = handler(mock_request_factory())
 
@@ -1136,7 +1136,7 @@ class TestErrorPathNormalization:
     ) -> None:
         @validate_http(error_formatter=_server_error_formatter)
         async def handler(req: HttpRequest) -> dict[str, object]:
-            return _nested_dict(300)
+            return _nested_dict(100_000)
 
         response = await handler(mock_request_factory())
 

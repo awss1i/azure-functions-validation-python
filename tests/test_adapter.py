@@ -543,8 +543,8 @@ class TestSerialize:
     @pytest.mark.parametrize(
         "value",
         [
-            pytest.param(_nested_dict(300), id="nested-dict"),
-            pytest.param([_nested_dict(300)], id="nested-list"),
+            pytest.param(_nested_dict(100_000), id="nested-dict"),
+            pytest.param([_nested_dict(100_000)], id="nested-list"),
             pytest.param(_self_referencing_dict(), id="self-reference"),
             pytest.param(PayloadModel(data=_nested_dict(300)), id="model"),
         ],
