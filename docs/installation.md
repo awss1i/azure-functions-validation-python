@@ -15,7 +15,7 @@
 | Component | Supported Range | Notes |
 | --- | --- | --- |
 | Python | 3.11-3.14 | Project metadata declares `>=3.11,<3.15`. Azure Functions has 3.11-3.14 generally available; 3.10 reaches end of support in October 2026. |
-| Pydantic | v2 (`>=2.0,<3.0`) | Validation models should inherit from `pydantic.BaseModel`. |
+| Pydantic | v2 (`>=2.11,<3.0`) | Validation models should inherit from `pydantic.BaseModel`. |
 | `azure-functions` | Required | Use with Python v2 decorator-based `FunctionApp`. |
 
 Compatibility expectations:
@@ -37,7 +37,7 @@ azure-functions
 azure-functions-validation
 ```
 
-If you pin dependencies, keep `pydantic` in the v2 major version.
+If you pin dependencies, keep `pydantic` at 2.11 or newer within the v2 major version.
 
 ## Verify Installation
 
@@ -98,7 +98,7 @@ For deterministic deployments, pin an explicit version in your dependency file.
 ### Pydantic version mismatch
 
 - Ensure Pydantic is v2 (`pip show pydantic`).
-- If v1 is installed transitively, pin `pydantic>=2,<3` and reinstall.
+- If v1 is installed transitively, pin `pydantic>=2.11,<3` and reinstall.
 
 ### Function app starts but validation decorator behavior is missing
 

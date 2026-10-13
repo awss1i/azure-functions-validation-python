@@ -1,6 +1,7 @@
 """Validation adapter layer for request/response validation."""
 
 from collections.abc import Callable
+import contextlib
 import dataclasses
 import json
 from typing import Any, Protocol, get_origin
@@ -35,6 +36,16 @@ _JSON_TYPE_ADAPTER = TypeAdapter(Any, config=ConfigDict(ser_json_inf_nan="null")
 
 
 def _dump_json(value: Any) -> str:
+    # Plain JSON values are encoded in one pass. Anything json.dumps can't write
+    # as standard JSON (other types, dict keys it rejects, NaN and infinities
+    # via allow_nan=False, cycles, very deep nesting) goes through Pydantic,
+    # which builds a JSON-compatible copy first.
+    with contextlib.suppress(TypeError, ValueError, RecursionError):
+        return json.dumps(value, allow_nan=False)
+    return _dump_json_via_pydantic(value)
+
+
+def _dump_json_via_pydantic(value: Any) -> str:
     try:
         compatible = _JSON_TYPE_ADAPTER.dump_python(
             value,
