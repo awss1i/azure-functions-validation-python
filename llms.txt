@@ -23,13 +23,32 @@ response schemas. FastAPI-like developer experience without the web framework.
 - `ErrorFormatter` — Custom error formatting callback
 - `ResponseValidationError` — Error raised when response validation fails
 - `SerializationError` — Error raised when serialization fails
+- `AdapterConformanceTests` — Pytest-agnostic custom-adapter contract suite
 
 ## Key Concepts
 
 - Decorator-first: `@validate_http(body=Model, response_model=Model)`
+- Successful responses default to status 200; set `status_code` for another success code.
+- `legacy_loc` temporarily omits input-source prefixes from error locations.
+- `request_model` is deprecated; use `body` instead.
+- Safe custom errors: 5xx formatters receive `InternalServerError` by default.
+- Opt-in body policies: `max_body_bytes` returns 413 above the byte limit;
+  `require_json_content_type` returns 415 for non-JSON non-empty bodies.
 - Request validation: body, query, path, headers all via Pydantic models
+- Plain models use lax coercion and ignore unknown fields. Prefer
+  `ConfigDict(strict=True, extra="forbid")` for closed JSON body contracts;
+  query, path, and header values arrive as strings and usually need coercion.
 - Automatic responses: 400/422 with `{"detail": [...]}` envelope on validation errors
+- Custom adapters raise `MalformedRequestError` for malformed syntax (400) and
+  `AdapterValidationError` for validation failures (422); all other exceptions,
+  including `ValueError`, are logged and sanitized as 500.
+- Adapter instances are created once at decoration and shared concurrently;
+  custom adapters must be stateless or thread-safe and should subclass
+  `AdapterConformanceTests` in their test suite.
 - Response enforcement: mismatches raise `ResponseValidationError` (HTTP 500)
+- Validated response serialization: `response_by_alias`,
+  `response_exclude_none`, and `response_exclude_unset` require `response_model`;
+  direct `HttpResponse` returns bypass them.
 - Per-handler error formatting via `ErrorFormatter` callback
 
 ## Quick Start
@@ -58,6 +77,7 @@ def create_user(req: func.HttpRequest, body: CreateUserRequest) -> CreateUserRes
 ## Documentation
 
 - [Getting Started](https://yeongseon.dev/azure-functions-python/validation/getting-started/)
+- [Strict API Boundary Models](https://yeongseon.dev/azure-functions-python/validation/strict-models/)
 - [API Reference](https://yeongseon.dev/azure-functions-python/validation/api/)
 - [Deployment Guide](https://yeongseon.dev/azure-functions-python/validation/deployment/)
 

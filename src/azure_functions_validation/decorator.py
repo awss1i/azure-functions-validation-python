@@ -36,8 +36,14 @@ def validate_http(
     response_model: Any = None,
     adapter: ValidationAdapter | None = None,
     error_formatter: ErrorFormatter | None = None,
+    expose_internal_errors: bool = False,
     status_code: int = 200,
     legacy_loc: bool = False,
+    response_by_alias: bool = True,
+    response_exclude_none: bool = False,
+    response_exclude_unset: bool = False,
+    max_body_bytes: int | None = None,
+    require_json_content_type: bool = False,
 ) -> Callable[..., Any]:
     """Decorator for validating HTTP request inputs and response outputs.
 
@@ -51,16 +57,42 @@ def validate_http(
         response_model: Pydantic model for response validation.
         adapter: Custom validation adapter (defaults to ``PydanticAdapter``).
         error_formatter: Per-handler custom error formatter.
+        expose_internal_errors: Unsafe opt-in that passes original server-side
+            exceptions to *error_formatter*. Defaults to ``False`` so custom
+            formatters receive a sanitized ``InternalServerError`` for 5xx errors.
         status_code: HTTP status code for successful responses (default 200).
             Use e.g. ``status_code=201`` for creation endpoints.
         legacy_loc: When ``True``, error ``loc`` values omit the leading
             input-source segment (``["email"]`` instead of ``["body", "email"]``).
             A one-cycle migration escape hatch; ignored when a custom *adapter*
             is supplied (configure that adapter directly).
+        response_by_alias: Serialize validated responses using field aliases.
+        response_exclude_none: Exclude fields whose value is ``None`` from
+            validated responses.
+        response_exclude_unset: Exclude fields that were not explicitly set from
+            validated responses.
+        max_body_bytes: Maximum accepted request-body size in bytes. Disabled by default.
+        require_json_content_type: Require a JSON media type for non-empty configured bodies.
 
     Returns:
         A decorator that wraps the handler with validation logic.
     """
+    if not isinstance(expose_internal_errors, bool):
+        raise TypeError("expose_internal_errors must be a bool")
+    if max_body_bytes is not None and (
+        isinstance(max_body_bytes, bool)
+        or not isinstance(max_body_bytes, int)
+        or max_body_bytes <= 0
+    ):
+        raise ValueError("max_body_bytes must be a positive integer")
+    if not isinstance(require_json_content_type, bool):
+        raise TypeError("require_json_content_type must be a bool")
+
+    if response_model is None and (
+        not response_by_alias or response_exclude_none or response_exclude_unset
+    ):
+        raise ValueError("response serialization options require response_model")
+
     # Handle request_model shorthand
     if request_model is not None:
         warnings.warn(
@@ -134,11 +166,17 @@ def validate_http(
             response_model=response_model,
             adapter=adapter,
             error_formatter=error_formatter,
+            expose_internal_errors=expose_internal_errors,
             func_params=func_params,
             request_param_name=request_param_name,
             response_type_adapter=response_type_adapter,
+            response_by_alias=response_by_alias,
+            response_exclude_none=response_exclude_none,
+            response_exclude_unset=response_exclude_unset,
             success_status_code=status_code,
             handler_name=getattr(func, "__qualname__", None) or getattr(func, "__name__", None),
+            max_body_bytes=max_body_bytes,
+            require_json_content_type=require_json_content_type,
         )
 
         wrapper = _make_wrapper(func, config, is_async=is_async)
