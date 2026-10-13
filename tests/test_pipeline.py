@@ -22,7 +22,14 @@ from azure.functions import HttpRequest
 from pydantic import BaseModel, Field
 import pytest
 
-from azure_functions_validation import validate_http
+from azure_functions_validation import (
+    HttpError,
+    InternalServerError,
+    MalformedRequestError,
+    validate_http,
+)
+from azure_functions_validation.adapter import PydanticAdapter
+from azure_functions_validation.errors import AdapterValidationError
 
 RequestFactory: TypeAlias = Callable[..., HttpRequest]
 
@@ -63,6 +70,12 @@ class StoredUserModel(PublicUserModel):
 
 class AliasedResponseModel(BaseModel):
     internal: str = Field(serialization_alias="wireName")
+
+
+class SerializationOptionsResponse(BaseModel):
+    internal: str = Field(serialization_alias="wireName")
+    optional_value: str | None = None
+    default_value: str = "default"
 
 
 class QueryModel(BaseModel):
@@ -289,6 +302,74 @@ class TestSuccessfulValidation:
 
         assert json.loads(response.get_body()) == {"wireName": "value"}
 
+    def test_response_serialization_options_apply_after_validation(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        @validate_http(
+            response_model=SerializationOptionsResponse,
+            response_by_alias=False,
+            response_exclude_none=True,
+            response_exclude_unset=True,
+        )
+        def handler(req: HttpRequest) -> dict[str, object]:
+            return {"internal": "value"}
+
+        response = handler(mock_request_factory())
+
+        assert json.loads(response.get_body()) == {"internal": "value"}
+
+    def test_response_serialization_options_support_generic_list_model(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        @validate_http(
+            response_model=list[SerializationOptionsResponse],
+            response_by_alias=False,
+            response_exclude_none=True,
+        )
+        def handler(req: HttpRequest) -> list[SerializationOptionsResponse]:
+            return [SerializationOptionsResponse(internal="value")]
+
+        response = handler(mock_request_factory())
+
+        assert json.loads(response.get_body()) == [
+            {"internal": "value", "default_value": "default"}
+        ]
+
+    def test_response_serialization_options_preserve_none_as_204(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        @validate_http(
+            response_model=SerializationOptionsResponse | None,
+            response_by_alias=False,
+            response_exclude_none=True,
+            response_exclude_unset=True,
+        )
+        def handler(req: HttpRequest) -> None:
+            return None
+
+        response = handler(mock_request_factory())
+
+        assert response.status_code == 204
+        assert response.get_body() == b""
+
+    def test_response_serialization_options_do_not_modify_http_response(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        from azure.functions import HttpResponse
+
+        @validate_http(
+            response_model=SerializationOptionsResponse,
+            response_by_alias=False,
+            response_exclude_none=True,
+            response_exclude_unset=True,
+        )
+        def handler(req: HttpRequest) -> HttpResponse:
+            return HttpResponse(body='{"wireName":null}', mimetype="application/json")
+
+        response = handler(mock_request_factory())
+
+        assert json.loads(response.get_body()) == {"wireName": None}
+
     def test_request_inputs_are_parsed_once(self, mock_request_factory: RequestFactory) -> None:
         """Test that configured request inputs are parsed only once."""
 
@@ -450,14 +531,16 @@ class TestValidationErrors:
         data = json.loads(response.get_body().decode())
         assert "detail" in data
 
-    def test_json_parsing_error(self, mock_request_factory: RequestFactory) -> None:
-        """Test 400 error for malformed JSON."""
+    @pytest.mark.parametrize("payload", [b"invalid json", b"\x80\x81\x82"])
+    def test_malformed_body_returns_400(
+        self, mock_request_factory: RequestFactory, payload: bytes
+    ) -> None:
 
         @validate_http(body=UserModel)
         def handler(req: HttpRequest, body: UserModel) -> ResponseModel:
             return ResponseModel(message="ok")
 
-        request = mock_request_factory(body=b"invalid json")
+        request = mock_request_factory(body=payload)
         response = handler(request)
 
         assert response.status_code == 400
@@ -465,16 +548,24 @@ class TestValidationErrors:
         data = json.loads(response.get_body().decode())
         assert "detail" in data
 
-    def test_missing_http_request_like_argument_returns_400(self) -> None:
+    def test_missing_http_request_like_argument_returns_sanitized_500(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         @validate_http(body=UserModel)
         def handler(req: HttpRequest, body: UserModel) -> ResponseModel:
             return ResponseModel(message="ok")
 
-        response = handler(req="not-a-request")
+        with caplog.at_level(logging.ERROR):
+            response = handler(req="not-a-request")
 
-        assert response.status_code == 400
+        assert response.status_code == 500
         data = json.loads(response.get_body().decode())
-        assert "detail" in data
+        assert data["detail"] == [
+            {"loc": [], "msg": "Internal Server Error", "type": "server_error"}
+        ]
+        records = [record for record in caplog.records if record.levelno == logging.ERROR]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
 
     def test_non_value_error_body_parse_returns_500(self, caplog: pytest.LogCaptureFixture) -> None:
         adapter = Mock()
@@ -578,25 +669,73 @@ class TestValidationErrors:
 
 
 class TestNonBodyErrorHierarchy:
-    """Tests that ValueError→400 and Exception→500 branches work for query/path/headers."""
-
-    def test_query_value_error_returns_400(self, mock_request_factory: RequestFactory) -> None:
+    @pytest.mark.parametrize("source", ["body", "query", "path", "headers"])
+    def test_unexpected_value_error_returns_logged_500(
+        self,
+        source: str,
+        mock_request_factory: RequestFactory,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         adapter = Mock()
-        adapter.parse_query.side_effect = ValueError("bad query param")
+        adapter.parse_body.return_value = UserModel(name="Valid", age=30)
+        adapter.parse_query.return_value = QueryModel()
+        adapter.parse_path.return_value = PathModel(user_id=1)
+        adapter.parse_headers.return_value = HeaderModel(authorization="Bearer x")
+        getattr(adapter, f"parse_{source}").side_effect = ValueError("adapter bug")
+
+        @validate_http(
+            body=UserModel,
+            query=QueryModel,
+            path=PathModel,
+            headers=HeaderModel,
+            adapter=adapter,
+        )
+        def handler(req: HttpRequest, **kwargs: object) -> ResponseModel:
+            return ResponseModel(message="ok")
+
+        with caplog.at_level(logging.ERROR, logger="azure_functions_validation.pipeline"):
+            response = handler(mock_request_factory(body=b"{}"))
+
+        assert response.status_code == 500
+        data = json.loads(response.get_body().decode())
+        assert data["detail"][0]["msg"] == "Internal Server Error"
+        records = [record for record in caplog.records if record.levelno == logging.ERROR]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+
+    def test_custom_adapter_malformed_request_error_returns_400(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        adapter = Mock()
+        adapter.parse_query.side_effect = MalformedRequestError("Malformed query syntax")
         adapter.format_error.return_value = {
-            "detail": [{"loc": [], "msg": "bad query param", "type": "value_error"}]
+            "detail": [{"loc": ["query"], "msg": "Malformed query syntax", "type": "value_error"}]
         }
 
         @validate_http(query=QueryModel, adapter=adapter)
         def handler(req: HttpRequest, query: QueryModel) -> ResponseModel:
             return ResponseModel(message="ok")
 
-        request = mock_request_factory(params={"limit": "10"})
-        response = handler(request)
+        response = handler(mock_request_factory())
 
         assert response.status_code == 400
-        data = json.loads(response.get_body().decode())
-        assert data["detail"][0]["msg"] == "bad query param"
+
+    def test_adapter_validation_error_still_returns_422(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        adapter = Mock()
+        adapter.parse_query.side_effect = AdapterValidationError(
+            "invalid query", [{"loc": ["query", "limit"], "msg": "invalid", "type": "value_error"}]
+        )
+        adapter.format_error.return_value = {"detail": adapter.parse_query.side_effect.errors}
+
+        @validate_http(query=QueryModel, adapter=adapter)
+        def handler(req: HttpRequest, query: QueryModel) -> ResponseModel:
+            return ResponseModel(message="ok")
+
+        response = handler(mock_request_factory())
+
+        assert response.status_code == 422
 
     def test_query_generic_exception_returns_500(
         self, mock_request_factory: RequestFactory
@@ -615,24 +754,6 @@ class TestNonBodyErrorHierarchy:
         data = json.loads(response.get_body().decode())
         assert data["detail"][0]["msg"] == "Internal Server Error"
 
-    def test_path_value_error_returns_400(self, mock_request_factory: RequestFactory) -> None:
-        adapter = Mock()
-        adapter.parse_path.side_effect = ValueError("bad path param")
-        adapter.format_error.return_value = {
-            "detail": [{"loc": [], "msg": "bad path param", "type": "value_error"}]
-        }
-
-        @validate_http(path=PathModel, adapter=adapter)
-        def handler(req: HttpRequest, path: PathModel) -> ResponseModel:
-            return ResponseModel(message="ok")
-
-        request = mock_request_factory(route_params={"user_id": "1"})
-        response = handler(request)
-
-        assert response.status_code == 400
-        data = json.loads(response.get_body().decode())
-        assert data["detail"][0]["msg"] == "bad path param"
-
     def test_path_generic_exception_returns_500(self, mock_request_factory: RequestFactory) -> None:
         adapter = Mock()
         adapter.parse_path.side_effect = RuntimeError("path exploded")
@@ -647,24 +768,6 @@ class TestNonBodyErrorHierarchy:
         assert response.status_code == 500
         data = json.loads(response.get_body().decode())
         assert data["detail"][0]["msg"] == "Internal Server Error"
-
-    def test_headers_value_error_returns_400(self, mock_request_factory: RequestFactory) -> None:
-        adapter = Mock()
-        adapter.parse_headers.side_effect = ValueError("bad header")
-        adapter.format_error.return_value = {
-            "detail": [{"loc": [], "msg": "bad header", "type": "value_error"}]
-        }
-
-        @validate_http(headers=HeaderModel, adapter=adapter)
-        def handler(req: HttpRequest, headers: HeaderModel) -> ResponseModel:
-            return ResponseModel(message="ok")
-
-        request = mock_request_factory(headers={"authorization": "Bearer x"})
-        response = handler(request)
-
-        assert response.status_code == 400
-        data = json.loads(response.get_body().decode())
-        assert data["detail"][0]["msg"] == "bad header"
 
     def test_headers_generic_exception_returns_500(
         self, mock_request_factory: RequestFactory
@@ -717,6 +820,23 @@ class TestAsyncHandlers:
         assert data["message"] == "Hello, Lucas"
 
     @pytest.mark.anyio
+    async def test_async_response_serialization_options(
+        self, mock_request_factory: RequestFactory
+    ) -> None:
+        @validate_http(
+            response_model=SerializationOptionsResponse,
+            response_by_alias=False,
+            response_exclude_none=True,
+            response_exclude_unset=True,
+        )
+        async def handler(req: HttpRequest) -> dict[str, str]:
+            return {"internal": "async"}
+
+        response = await handler(mock_request_factory())
+
+        assert json.loads(response.get_body()) == {"internal": "async"}
+
+    @pytest.mark.anyio
     async def test_async_handler_with_kwargs_only(
         self, mock_request_factory: RequestFactory
     ) -> None:
@@ -730,6 +850,101 @@ class TestAsyncHandlers:
         assert response.status_code == 200
         data = json.loads(response.get_body().decode())
         assert data["message"] == "Hello, Quinn"
+
+    @pytest.mark.anyio
+    async def test_missing_request_returns_sanitized_logged_500(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        @validate_http(body=UserModel)
+        async def handler(req: HttpRequest, body: UserModel) -> ResponseModel:
+            return ResponseModel(message="ok")
+
+        with caplog.at_level(logging.ERROR):
+            response = await handler(req="not-a-request")
+
+        assert response.status_code == 500
+        assert json.loads(response.get_body())["detail"][0]["msg"] == "Internal Server Error"
+        records = [record for record in caplog.records if record.levelno == logging.ERROR]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("payload", [b"invalid json", b"\x80\x81\x82"])
+    async def test_malformed_body_returns_400(
+        self, mock_request_factory: RequestFactory, payload: bytes
+    ) -> None:
+        @validate_http(body=UserModel)
+        async def handler(req: HttpRequest, body: UserModel) -> ResponseModel:
+            return ResponseModel(message="ok")
+
+        response = await handler(mock_request_factory(body=payload))
+
+        assert response.status_code == 400
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("source", ["body", "query", "path", "headers"])
+    async def test_unexpected_adapter_value_error_returns_logged_500(
+        self,
+        source: str,
+        mock_request_factory: RequestFactory,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        adapter = Mock()
+        adapter.parse_body.return_value = UserModel(name="Valid", age=30)
+        adapter.parse_query.return_value = QueryModel()
+        adapter.parse_path.return_value = PathModel(user_id=1)
+        adapter.parse_headers.return_value = HeaderModel(authorization="Bearer x")
+        getattr(adapter, f"parse_{source}").side_effect = ValueError("adapter bug")
+
+        @validate_http(
+            body=UserModel,
+            query=QueryModel,
+            path=PathModel,
+            headers=HeaderModel,
+            adapter=adapter,
+        )
+        async def handler(req: HttpRequest, **kwargs: object) -> ResponseModel:
+            return ResponseModel(message="ok")
+
+        with caplog.at_level(logging.ERROR, logger="azure_functions_validation.pipeline"):
+            response = await handler(mock_request_factory(body=b"{}"))
+
+        assert response.status_code == 500
+        records = [record for record in caplog.records if record.levelno == logging.ERROR]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("exception", "expected_status"),
+        [
+            (MalformedRequestError("Malformed query syntax"), 400),
+            (
+                AdapterValidationError(
+                    "invalid query",
+                    [{"loc": ["query", "limit"], "msg": "invalid", "type": "value_error"}],
+                ),
+                422,
+            ),
+        ],
+    )
+    async def test_expected_adapter_errors_keep_client_status(
+        self,
+        exception: Exception,
+        expected_status: int,
+        mock_request_factory: RequestFactory,
+    ) -> None:
+        adapter = Mock()
+        adapter.parse_query.side_effect = exception
+        adapter.format_error.return_value = {"detail": []}
+
+        @validate_http(query=QueryModel, adapter=adapter)
+        async def handler(req: HttpRequest, query: QueryModel) -> ResponseModel:
+            return ResponseModel(message="ok")
+
+        response = await handler(mock_request_factory())
+
+        assert response.status_code == expected_status
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +979,93 @@ class TestHttpRequestInjection:
 
 class TestCustomErrorFormatter:
     """Tests for custom error formatter functionality."""
+
+    @pytest.mark.parametrize("failure", ["parse", "serialize", "response", "http_error"])
+    def test_custom_formatter_receives_sanitized_exception_for_sync_5xx_paths(
+        self,
+        failure: str,
+        mock_request_factory: RequestFactory,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        captured: list[Exception] = []
+
+        def formatter(exc: Exception, status_code: int) -> dict[str, object]:
+            captured.append(exc)
+            return {"message": str(exc), "status": status_code}
+
+        adapter = PydanticAdapter()
+        if failure == "parse":
+            adapter = Mock(spec=PydanticAdapter)
+            adapter.parse_body.side_effect = RuntimeError("parse secret")
+        response_model = ResponseModel if failure == "response" else None
+
+        @validate_http(
+            body=UserModel if failure == "parse" else None,
+            response_model=response_model,
+            adapter=adapter,
+            error_formatter=formatter,
+        )
+        def handler(req: HttpRequest) -> object:
+            if failure == "serialize":
+                return object()
+            if failure == "response":
+                return {"wrong": "shape"}
+            if failure == "http_error":
+                raise HttpError(503, "database secret")
+            return {"ok": True}
+
+        with caplog.at_level(logging.ERROR):
+            response = handler(mock_request_factory(body=b'{"name": "Ada", "age": 30}'))
+
+        assert response.status_code >= 500
+        assert len(captured) == 1
+        assert isinstance(captured[0], InternalServerError)
+        assert str(captured[0]) == "Internal Server Error"
+        records = [record for record in caplog.records if record.exc_info is not None]
+        assert len(records) == 1
+
+    @pytest.mark.anyio
+    async def test_async_5xx_formatter_receives_sanitized_exception(
+        self,
+        mock_request_factory: RequestFactory,
+    ) -> None:
+        captured: list[Exception] = []
+
+        def formatter(exc: Exception, status_code: int) -> dict[str, object]:
+            captured.append(exc)
+            return {"message": str(exc)}
+
+        @validate_http(error_formatter=formatter)
+        async def handler(req: HttpRequest) -> object:
+            raise HttpError(500, "async secret")
+
+        response = await handler(mock_request_factory())
+
+        assert response.status_code == 500
+        assert len(captured) == 1
+        assert isinstance(captured[0], InternalServerError)
+
+    def test_expose_internal_errors_passes_original_exception(
+        self,
+        mock_request_factory: RequestFactory,
+    ) -> None:
+        captured: list[Exception] = []
+
+        def formatter(exc: Exception, status_code: int) -> dict[str, object]:
+            captured.append(exc)
+            return {"message": str(exc)}
+
+        original = HttpError(500, "unsafe secret")
+
+        @validate_http(error_formatter=formatter, expose_internal_errors=True)
+        def handler(req: HttpRequest) -> object:
+            raise original
+
+        response = handler(mock_request_factory())
+
+        assert response.status_code == 500
+        assert captured == [original]
+        assert json.loads(response.get_body()) == {"message": "unsafe secret"}
 
     def test_custom_formatter_for_validation_error(
         self, mock_request_factory: RequestFactory
@@ -1047,20 +1349,17 @@ class TestDataclassReturn:
 class TestErrorPathNormalization:
     """Tests for normalized error handling (Issue #99)."""
 
-    def test_resolve_http_request_error_returns_400(
+    def test_resolve_http_request_error_returns_500(
         self,
         mock_request_factory: RequestFactory,
     ) -> None:
-        """Test that _resolve_http_request ValueError produces 400."""
-
         @validate_http(body=UserModel)
         def handler(req: HttpRequest, body: UserModel) -> ResponseModel:
             return ResponseModel(message="ok")
 
-        # Pass non-HttpRequest-like to trigger ValueError
         response = handler(req="not-a-request")
 
-        assert response.status_code == 400
+        assert response.status_code == 500
         data = json.loads(response.get_body().decode())
         assert "detail" in data
 

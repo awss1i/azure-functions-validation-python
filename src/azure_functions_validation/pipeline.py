@@ -20,8 +20,11 @@ from .errors import (
     AdapterValidationError,
     ErrorFormatter,
     HttpError,
-    ResponseValidationError,
+    MalformedRequestError,
+    PayloadTooLargeError,
+    RequestBindingError,
     SerializationError,
+    UnsupportedMediaTypeError,
     format_error_response,
 )
 
@@ -44,11 +47,44 @@ class PipelineConfig:
     response_model: Any = None
     adapter: ValidationAdapter = field(default_factory=PydanticAdapter)
     error_formatter: ErrorFormatter | None = None
+    expose_internal_errors: bool = False
     func_params: Mapping[str, Any] = field(default_factory=dict)
     request_param_name: str | None = None
     response_type_adapter: Any = None
+    response_by_alias: bool = True
+    response_exclude_none: bool = False
+    response_exclude_unset: bool = False
     success_status_code: int = 200
     handler_name: str | None = None
+    max_body_bytes: int | None = None
+    require_json_content_type: bool = False
+
+
+def _format_error(exception: Exception, status_code: int, config: PipelineConfig) -> HttpResponse:
+    return format_error_response(
+        exception,
+        status_code,
+        config.adapter,
+        config.error_formatter,
+        expose_internal_errors=config.expose_internal_errors,
+        handler_name=config.handler_name,
+    )
+
+
+def _format_logged_error(
+    exception: Exception,
+    status_code: int,
+    config: PipelineConfig,
+) -> HttpResponse:
+    return format_error_response(
+        exception,
+        status_code,
+        config.adapter,
+        config.error_formatter,
+        expose_internal_errors=config.expose_internal_errors,
+        handler_name=config.handler_name,
+        log_exception=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +105,8 @@ def _prepare_invocation(
     """
     try:
         http_request = _resolve_http_request(args, kwargs, config)
-    except ValueError as e:
-        return format_error_response(e, 400, config.adapter, config.error_formatter), {}
+    except RequestBindingError as e:
+        return _format_error(e, 500, config), {}
     parsed = _parse_inputs(http_request, config)
     if isinstance(parsed, HttpResponse):
         return parsed, {}
@@ -91,14 +127,7 @@ def run_pipeline(
     try:
         result = func(*args, **merged) if args else func(**merged)
     except HttpError as e:
-        if e.status_code >= 500:
-            logger.error(
-                "Handler %r raised a server-side HttpError (%d)",
-                config.handler_name,
-                e.status_code,
-                exc_info=True,
-            )
-        return format_error_response(e, e.status_code, config.adapter, config.error_formatter)
+        return _format_error(e, e.status_code, config)
     return _build_response(result, config)
 
 
@@ -115,14 +144,7 @@ async def run_pipeline_async(
     try:
         result = await (func(*args, **merged) if args else func(**merged))
     except HttpError as e:
-        if e.status_code >= 500:
-            logger.error(
-                "Handler %r raised a server-side HttpError (%d)",
-                config.handler_name,
-                e.status_code,
-                exc_info=True,
-            )
-        return format_error_response(e, e.status_code, config.adapter, config.error_formatter)
+        return _format_error(e, e.status_code, config)
     return _build_response(result, config)
 
 
@@ -169,7 +191,7 @@ def _resolve_http_request(
         if _is_http_request_like(value):
             return value
 
-    raise ValueError("Function must receive an HttpRequest-like object as argument")
+    raise RequestBindingError("Function must receive an HttpRequest-like object as argument")
 
 
 def _inject_named(
@@ -188,6 +210,42 @@ def _inject_body(
         parsed_inputs["body"] = parsed
     elif "req_model" in config.func_params and config.request_model is not None:
         parsed_inputs["req_model"] = parsed
+
+
+def _header_value(http_request: Any, name: str) -> str | None:
+    headers = http_request.headers or {}
+    target = name.casefold()
+    return next((value for key, value in headers.items() if key.casefold() == target), None)
+
+
+def _is_json_media_type(content_type: str | None) -> bool:
+    if content_type is None:
+        return False
+    media_type = content_type.partition(";")[0].strip().casefold()
+    return media_type == "application/json" or (
+        media_type.startswith("application/") and media_type.endswith("+json")
+    )
+
+
+def _enforce_body_policies(http_request: Any, config: PipelineConfig) -> None:
+    declared_length = _header_value(http_request, "content-length")
+    if config.max_body_bytes is not None and declared_length is not None:
+        try:
+            declared_bytes = int(declared_length)
+        except ValueError:
+            declared_bytes = 0
+        if declared_bytes > config.max_body_bytes:
+            raise PayloadTooLargeError
+
+    body = http_request.get_body()
+    if config.max_body_bytes is not None and len(body) > config.max_body_bytes:
+        raise PayloadTooLargeError
+    if (
+        body
+        and config.require_json_content_type
+        and not _is_json_media_type(_header_value(http_request, "content-type"))
+    ):
+        raise UnsupportedMediaTypeError
 
 
 def _parse_inputs(
@@ -218,18 +276,24 @@ def _parse_inputs(
             continue
         # Always validate the configured input, even if the handler ignores it.
         try:
+            if name == "body":
+                _enforce_body_policies(http_request, config)
             parsed = parse(http_request, model)
+        except PayloadTooLargeError as e:
+            return _format_error(e, 413, config)
+        except UnsupportedMediaTypeError as e:
+            return _format_error(e, 415, config)
         except AdapterValidationError as e:
-            return format_error_response(e, 422, config.adapter, config.error_formatter)
-        except ValueError as e:
-            return format_error_response(e, 400, config.adapter, config.error_formatter)
+            return _format_error(e, 422, config)
+        except MalformedRequestError as e:
+            return _format_error(e, 400, config)
         except Exception as e:
             logger.exception(
                 "Unexpected input parsing error for handler %r in %s",
                 config.handler_name,
                 name,
             )
-            return format_error_response(e, 500, config.adapter, config.error_formatter)
+            return _format_logged_error(e, 500, config)
         inject(name, parsed, config, parsed_inputs)
 
     # Add original HttpRequest if requested
@@ -268,50 +332,23 @@ def _build_response(result: Any, config: PipelineConfig) -> HttpResponse:
             validated_result = config.adapter.validate_response(
                 result, config.response_model, type_adapter=config.response_type_adapter
             )
-        except AdapterValidationError:
-            logger.error(
-                "Response validation failed for handler %r",
-                config.handler_name,
-                exc_info=True,
-            )
-            response_error = ResponseValidationError("Response validation failed")
-            return format_error_response(
-                response_error,
-                500,
-                config.adapter,
-                config.error_formatter,
-            )
-        except Exception:
-            logger.error(
-                "Unexpected error during response validation for handler %r",
-                config.handler_name,
-                exc_info=True,
-            )
-            response_error = ResponseValidationError("Response validation failed")
-            return format_error_response(
-                response_error,
-                500,
-                config.adapter,
-                config.error_formatter,
-            )
+        except AdapterValidationError as e:
+            return _format_error(e, 500, config)
+        except Exception as e:
+            return _format_error(e, 500, config)
 
         if validated_result is None:
             return HttpResponse(status_code=204)
 
         try:
-            content = config.response_type_adapter.dump_json(validated_result, by_alias=True)
+            content = config.response_type_adapter.dump_json(
+                validated_result,
+                by_alias=config.response_by_alias,
+                exclude_none=config.response_exclude_none,
+                exclude_unset=config.response_exclude_unset,
+            )
         except (SerializationError, TypeError, ValueError) as e:
-            logger.error(
-                "Failed to serialize validated response for handler %r",
-                config.handler_name,
-                exc_info=True,
-            )
-            return format_error_response(
-                e,
-                500,
-                config.adapter,
-                config.error_formatter,
-            )
+            return _format_error(e, 500, config)
 
         return HttpResponse(
             body=content,
@@ -323,17 +360,7 @@ def _build_response(result: Any, config: PipelineConfig) -> HttpResponse:
     try:
         content, content_type = config.adapter.serialize(result)
     except (SerializationError, TypeError) as e:
-        logger.error(
-            "Failed to serialize response for handler %r",
-            config.handler_name,
-            exc_info=True,
-        )
-        return format_error_response(
-            e,
-            500,
-            config.adapter,
-            config.error_formatter,
-        )
+        return _format_error(e, 500, config)
 
     return HttpResponse(
         body=content,

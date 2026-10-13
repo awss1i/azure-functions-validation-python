@@ -53,6 +53,42 @@ class LegacyModel(BaseModelV1):
 class TestConfigurationErrors:
     """Tests for decorator configuration errors."""
 
+    @pytest.mark.parametrize("value", [None, 0, 1, "false"])
+    def test_expose_internal_errors_rejects_non_bool(self, value: object) -> None:
+        options: dict[str, Any] = {"expose_internal_errors": value}
+        with pytest.raises(TypeError, match="expose_internal_errors must be a bool"):
+            validate_http(**options)
+
+    @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "10"])
+    def test_max_body_bytes_rejects_invalid_values(self, value: object) -> None:
+        options: dict[str, Any] = {"max_body_bytes": value}
+        with pytest.raises(ValueError, match="max_body_bytes must be a positive integer"):
+            validate_http(**options)
+
+    @pytest.mark.parametrize("value", [None, 0, 1, "true"])
+    def test_require_json_content_type_rejects_non_bool(self, value: object) -> None:
+        options: dict[str, Any] = {"require_json_content_type": value}
+        with pytest.raises(TypeError, match="require_json_content_type must be a bool"):
+            validate_http(**options)
+
+    @pytest.mark.parametrize(
+        ("option_name", "option_value"),
+        [
+            ("response_by_alias", False),
+            ("response_exclude_none", True),
+            ("response_exclude_unset", True),
+        ],
+    )
+    def test_response_serialization_option_requires_response_model(
+        self, option_name: str, option_value: bool
+    ) -> None:
+        options: dict[str, Any] = {option_name: option_value}
+
+        with pytest.raises(
+            ValueError, match="response serialization options require response_model"
+        ):
+            validate_http(**options)
+
     @pytest.mark.parametrize(
         "model_option",
         ["body", "query", "path", "headers", "request_model", "response_model"],
