@@ -439,7 +439,7 @@ class PydanticAdapter:
             if predicate(obj):
                 try:
                     return serializer(obj)
-                except ValueError as exc:
+                except (RecursionError, ValueError) as exc:
                     # pydantic-core reports cycles and its nesting limit as ValueError,
                     # and PydanticSerializationError is a ValueError subclass.
                     raise SerializationError(type(obj).__name__) from exc

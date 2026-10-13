@@ -1,5 +1,6 @@
 """Tests for validation adapter."""
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from typing import TYPE_CHECKING, Any, cast
@@ -45,6 +46,17 @@ class HeaderModel(BaseModel):
 
 class PayloadModel(BaseModel):
     data: dict[str, Any]
+
+
+@dataclass
+class RecursiveDataclass:
+    child: "RecursiveDataclass | None" = None
+
+
+def _self_referencing_dataclass() -> RecursiveDataclass:
+    value = RecursiveDataclass()
+    value.child = value
+    return value
 
 
 def _nested_dict(depth: int) -> dict[str, Any]:
@@ -548,6 +560,7 @@ class TestSerialize:
             pytest.param([_nested_dict(100_000)], id="nested-list"),
             pytest.param(_self_referencing_dict(), id="self-reference"),
             pytest.param(PayloadModel(data=_nested_dict(300)), id="model"),
+            pytest.param(_self_referencing_dataclass(), id="recursive-dataclass"),
         ],
     )
     def test_serialize_unserializable_value_raises_serialization_error(
@@ -558,7 +571,7 @@ class TestSerialize:
         with pytest.raises(SerializationError) as exc_info:
             adapter.serialize(value)
 
-        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert isinstance(exc_info.value.__cause__, ValueError | RecursionError)
 
 
 # Test format_error
