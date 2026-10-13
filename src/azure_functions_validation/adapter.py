@@ -50,6 +50,7 @@ def _dump_json_via_pydantic(value: Any) -> str:
         compatible = _JSON_TYPE_ADAPTER.dump_python(
             value,
             mode="json",
+            by_alias=True,
             fallback=lambda unsupported: (_ for _ in ()).throw(
                 SerializationError(type(unsupported).__name__)
             ),
