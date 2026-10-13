@@ -39,6 +39,30 @@ def create_user(req: func.HttpRequest, body: CreateUserBody) -> CreateUserResult
     Think of the decorator as a request/response contract layer:
     parse -> validate -> call handler -> validate response -> serialize.
 
+## Strict API boundary models
+
+The decorator respects each model's Pydantic configuration. A plain
+`BaseModel` uses lax coercion and ignores unknown fields: for example, `"123"`
+can become an integer and an undeclared field is dropped. For closed JSON body
+contracts, derive request models from a reusable base:
+
+```python
+from pydantic import BaseModel, ConfigDict
+
+
+class StrictApiModel(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+```
+
+Do not automatically reuse that strict base for `query=`, `path=`, or
+`headers=` models. Those values arrive as strings, so `strict=True` rejects
+common inputs such as `?limit=10` for an `int` field. Use a separate model with
+`ConfigDict(extra="forbid")` when you want normal URL/header parsing while
+still rejecting unknown fields.
+
+See [Strict API boundary models](strict-models.md) for runnable permissive and
+strict examples, exact `422` bodies, and source-specific recommendations.
+
 ## Input source patterns
 
 ### Body only
@@ -50,6 +74,23 @@ Use `body=Model` when your endpoint is driven only by JSON payload data.
 def handler(req: func.HttpRequest, body: CreateUserBody) -> dict[str, str]:
     return {"name": body.name}
 ```
+
+For an endpoint that requires JSON and caps the application-visible body at 1
+MiB, opt in explicitly:
+
+```python
+@validate_http(
+    body=CreateUserBody,
+    max_body_bytes=1_048_576,
+    require_json_content_type=True,
+)
+def protected_handler(req: func.HttpRequest, body: CreateUserBody) -> dict[str, str]:
+    return {"name": body.name}
+```
+
+This returns `413` above the byte limit and `415` for a non-empty body without
+a JSON media type. Azure has already buffered the request, so enforce transport
+limits in the host or API Management too.
 
 ### Query only
 
@@ -236,7 +277,30 @@ def custom_status(req: func.HttpRequest) -> func.HttpResponse:
 ```
 
 !!! note "Bypass behavior"
-    Returning `func.HttpResponse` skips response model validation intentionally.
+    Returning `func.HttpResponse` skips response model validation and all
+    response serialization options intentionally.
+
+### Pattern E: validated serialization options
+
+```python
+class UserOut(BaseModel):
+    display_name: str = Field(serialization_alias="displayName")
+    nickname: str | None = None
+
+
+@validate_http(
+    response_model=UserOut,
+    response_by_alias=False,
+    response_exclude_none=True,
+    response_exclude_unset=True,
+)
+def get_user(req: func.HttpRequest) -> UserOut:
+    return UserOut(display_name="Ada")
+```
+
+This emits `{"display_name": "Ada"}` after validating the result. The options
+require `response_model`; `response_exclude_none` and `response_exclude_unset`
+do not remove fields from the endpoint response schema.
 
 ## Error handling strategies
 
@@ -263,10 +327,11 @@ from typing import Any
 
 
 def formatter(exc: Exception, status_code: int) -> dict[str, Any]:
+    message = str(exc) if status_code < 500 else "Internal Server Error"
     return {
         "error": {
             "code": f"VALIDATION_{status_code}",
-            "message": str(exc),
+            "message": message,
         }
     }
 
@@ -383,6 +448,7 @@ See [Troubleshooting](troubleshooting.md) for issue-by-issue fixes.
 
 ## Related pages
 
+- [Strict API boundary models](strict-models.md)
 - [Configuration](configuration.md)
 - [API Reference](api.md)
 - [Architecture](architecture.md)

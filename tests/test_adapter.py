@@ -1,14 +1,17 @@
 """Tests for validation adapter."""
 
+from datetime import UTC, datetime
 import json
 from typing import TYPE_CHECKING, Any, cast
+from uuid import UUID
 
 import azure.functions as func
 from pydantic import BaseModel, ConfigDict, Field
 import pytest
 
+from azure_functions_validation import adapter as adapter_module
 from azure_functions_validation.adapter import PydanticAdapter
-from azure_functions_validation.errors import AdapterValidationError
+from azure_functions_validation.errors import AdapterValidationError, MalformedRequestError
 
 if TYPE_CHECKING:
     import pytest
@@ -141,10 +144,9 @@ class TestParseBody:
         assert len(exc_info.value.errors) == 1
 
     def test_invalid_json(self, adapter: PydanticAdapter, mock_request: type) -> None:
-        """Test parsing invalid JSON raises ValueError."""
         req = mock_request(b"{invalid json}")
 
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises(MalformedRequestError) as exc_info:
             adapter.parse_body(req, UserModel)
 
         assert "Invalid JSON" in str(exc_info.value)
@@ -194,12 +196,11 @@ class TestParseBody:
         errors = exc_info.value.errors
         assert errors[0]["type"] == "missing"
 
-    def test_invalid_utf8_body_raises_value_error(
+    def test_invalid_utf8_body_raises_malformed_request_error(
         self, adapter: PydanticAdapter, mock_request: type
     ) -> None:
-        """Test that non-UTF-8 body bytes raise ValueError, not UnicodeDecodeError."""
         req = mock_request(b"\x80\x81\x82")
-        with pytest.raises(ValueError, match="Invalid JSON"):
+        with pytest.raises(MalformedRequestError, match="Invalid JSON"):
             adapter.parse_body(req, UserModel)
 
 
@@ -731,3 +732,80 @@ class TestSerializeBroaderTypes:
 
         with pytest.raises(SerializationError, match="Cannot serialize type object"):
             adapter.serialize(object())
+
+
+def _nested(depth: int) -> object:
+    value: object = 1
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+class TestDirectJsonFastPath:
+    """Plain JSON return values are encoded without the Pydantic pass."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected", "via_pydantic"),
+        [
+            pytest.param(
+                [{"id": 1, "name": "café", "ok": True, "tags": ["a"], "next": None}],
+                '[{"id": 1, "name": "caf\\u00e9", "ok": true, "tags": ["a"], "next": null}]',
+                False,
+                id="plain-json",
+            ),
+            pytest.param({None: 1}, '{"null": 1}', False, id="none-key"),
+            pytest.param(_nested(300), "[" * 300 + "1" + "]" * 300, False, id="nested-300"),
+            pytest.param(
+                {"at": datetime(2026, 1, 2, tzinfo=UTC)},
+                '{"at": "2026-01-02T00:00:00Z"}',
+                True,
+                id="datetime",
+            ),
+            pytest.param(
+                {UUID(int=7): 1}, '{"00000000-0000-0000-0000-000000000007": 1}', True, id="uuid-key"
+            ),
+            pytest.param({"a": 1, "b": float("nan")}, '{"a": 1, "b": null}', True, id="nan"),
+            pytest.param(
+                {"g": (i for i in range(3)), "v": float("nan")},
+                '{"g": [0, 1, 2], "v": null}',
+                True,
+                id="generator-then-nan",
+            ),
+        ],
+    )
+    def test_serialize_uses_pydantic_only_when_json_dumps_cannot(
+        self,
+        adapter: PydanticAdapter,
+        monkeypatch: pytest.MonkeyPatch,
+        value: object,
+        expected: str,
+        via_pydantic: bool,
+    ) -> None:
+        calls: list[object] = []
+        dump_via_pydantic = adapter_module._dump_json_via_pydantic
+
+        def spy(obj: object) -> str:
+            calls.append(obj)
+            return dump_via_pydantic(obj)
+
+        monkeypatch.setattr(adapter_module, "_dump_json_via_pydantic", spy)
+
+        content, content_type = adapter.serialize(value)
+
+        assert content_type == "application/json"
+        assert content == expected
+        assert bool(calls) is via_pydantic
+
+    def test_nesting_past_json_dumps_limit_falls_back_to_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[object] = []
+
+        def spy(obj: object) -> str:
+            calls.append(obj)
+            return "via pydantic"
+
+        monkeypatch.setattr(adapter_module, "_dump_json_via_pydantic", spy)
+
+        assert adapter_module._dump_json(_nested(100_000)) == "via pydantic"
+        assert len(calls) == 1

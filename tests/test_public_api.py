@@ -9,9 +9,15 @@ import pytest
 
 import azure_functions_validation
 from azure_functions_validation import (
+    AdapterConformanceTests,
+    AdapterValidationError,
     ErrorFormatter,
     HttpError,
+    InternalServerError,
+    MalformedRequestError,
+    PayloadTooLargeError,
     ResponseValidationError,
+    UnsupportedMediaTypeError,
     validate_http,
 )
 
@@ -33,6 +39,12 @@ class TestAPISurface:
             "ValidationAdapter",
             "PydanticAdapter",
             "HttpError",
+            "InternalServerError",
+            "MalformedRequestError",
+            "PayloadTooLargeError",
+            "UnsupportedMediaTypeError",
+            "AdapterValidationError",
+            "AdapterConformanceTests",
         }
 
     def test_version_matches_distribution_metadata(self) -> None:
@@ -45,6 +57,24 @@ class TestAPISurface:
 
     def test_response_validation_error_is_exception(self) -> None:
         assert issubclass(ResponseValidationError, Exception)
+
+    def test_internal_server_error_is_public_and_sanitized(self) -> None:
+        error = InternalServerError()
+        assert str(error) == "Internal Server Error"
+        assert error.__cause__ is None
+        assert error.__context__ is None
+
+    def test_malformed_request_error_is_plain_exception(self) -> None:
+        assert issubclass(MalformedRequestError, Exception)
+        assert not issubclass(MalformedRequestError, ValueError)
+
+    def test_body_policy_errors_are_public_exceptions(self) -> None:
+        assert issubclass(PayloadTooLargeError, Exception)
+        assert issubclass(UnsupportedMediaTypeError, Exception)
+
+    def test_adapter_contract_exports_are_public(self) -> None:
+        assert issubclass(AdapterValidationError, Exception)
+        assert hasattr(AdapterConformanceTests, "make_adapter")
 
     def test_error_formatter_is_callable_alias(self) -> None:
         # ErrorFormatter is Callable[[Exception, int], dict[str, Any]]

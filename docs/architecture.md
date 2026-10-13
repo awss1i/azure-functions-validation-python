@@ -99,6 +99,7 @@ Owns:
 
 Owns:
 
+- `MalformedRequestError` for explicit malformed-client-input classification
 - `ResponseValidationError`
 - `ErrorFormatter` alias
 - `format_error_response(...)`
@@ -106,8 +107,14 @@ Owns:
 Error shaping policy:
 
 - validation/parsing errors use structured JSON payloads
-- 500-level internal errors are sanitized by default unless a custom formatter
-  is provided
+- `MalformedRequestError` maps to 400, `AdapterValidationError` maps to 422,
+  and all other adapter exceptions map to a logged, sanitized 500
+- request binding failures are internal pipeline errors and map to a logged,
+  sanitized 500
+- custom formatters receive original exceptions for 4xx errors
+- 500-level originals are logged once with traceback, while custom formatters
+  receive a sanitized `InternalServerError` by default
+- `expose_internal_errors=True` is an unsafe compatibility opt-in
 
 
 ## Module boundaries
@@ -154,8 +161,12 @@ Exported symbols (via `__all__`):
 - `SerializationError` — exception type for response serialization failures
 - `ErrorFormatter` — type alias for custom error formatting callables
 - `HttpError` — raise from a handler to return a controlled error envelope
+- `InternalServerError` — sanitized exception passed to custom 5xx formatters
+- `MalformedRequestError` — custom adapters raise this for malformed client syntax
 - `ValidationAdapter` — the adapter protocol (public extension point)
 - `PydanticAdapter` — the default Pydantic v2 adapter implementation
+- `AdapterValidationError` — normalized backend-independent validation failure
+- `AdapterConformanceTests` — reusable public adapter contract tests
 - `__version__` — package version string
 
 Everything else (`PipelineConfig`, internal pipeline functions) is not part of
@@ -166,6 +177,11 @@ the top-level public API.
 ### 1. Pydantic v2 adapter pattern
 
 Validation is delegated to a `ValidationAdapter` protocol. The default `PydanticAdapter` uses Pydantic v2 for validation and type coercion. The protocol exists for extensibility but most deployments should use the default.
+
+The protocol's parser exception taxonomy is part of that public contract:
+`MalformedRequestError` means malformed client syntax (`400`),
+`AdapterValidationError` means model validation failure (`422`), and every other
+exception—including `ValueError`—means an adapter fault (`500`).
 
 ### 2. Immutable pipeline configuration
 

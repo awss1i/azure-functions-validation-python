@@ -52,7 +52,7 @@ Cause:
 
 Fix:
 
-- pin and install `pydantic>=2,<3`
+- pin and install `pydantic>=2.11,<3`
 
 !!! warning "Version drift"
     If local tests pass but deployed runtime fails, compare the lockfile and the
@@ -245,7 +245,7 @@ Fix:
         return {
             "error": {
                 "code": f"VALIDATION_{status_code}",
-                "message": str(exc),
+            "message": str(exc) if status_code < 500 else "Internal Server Error",
             }
         }
     ```

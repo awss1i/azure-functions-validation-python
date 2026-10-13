@@ -11,10 +11,15 @@ in production handlers.
     headers=...,
     request_model=...,
     response_model=...,
+    response_by_alias=True,
+    response_exclude_none=False,
+    response_exclude_unset=False,
     adapter=...,
     error_formatter=...,
     status_code=200,
     legacy_loc=False,
+    max_body_bytes=None,
+    require_json_content_type=False,
 )
 ```
 
@@ -28,10 +33,15 @@ Public keyword-only parameters:
 - `headers`
 - `request_model`
 - `response_model`
+- `response_by_alias` (default `True`)
+- `response_exclude_none` (default `False`)
+- `response_exclude_unset` (default `False`)
 - `adapter`
 - `error_formatter`
 - `status_code` (default `200`)
 - `legacy_loc` (default `False`)
+- `max_body_bytes` (default `None`)
+- `require_json_content_type` (default `False`)
 
 !!! note "Keyword-only API"
     `validate_http` parameters are keyword-only. Prefer explicit names for
@@ -59,9 +69,49 @@ Behavior:
 - Invalid JSON syntax -> `400`
 - Invalid field values -> `422`
 
+The model's own Pydantic configuration controls coercion and unknown fields.
+Plain `BaseModel` defaults are lax coercion plus `extra="ignore"`. For a closed
+JSON contract, see [Strict API boundary models](strict-models.md) for the
+reusable `ConfigDict(strict=True, extra="forbid")` pattern and exact errors.
+
+### `max_body_bytes`
+
+Set a positive byte limit to reject oversized configured bodies with `413
+Payload Too Large` before JSON decoding or custom-adapter parsing. The default
+`None` preserves unlimited application-level behavior. The byte count uses
+`req.get_body()`; a declared `Content-Length` above the limit can be rejected
+first, but Azure Functions has already buffered the body before user code runs.
+
+```python
+@validate_http(body=CreateBody, max_body_bytes=1_048_576)
+def create(req: func.HttpRequest, body: CreateBody) -> dict[str, str]:
+    return {"name": body.name}
+```
+
+`max_body_bytes` is an application contract, not transport-level DoS
+protection. Configure Azure Functions host and/or API Management request-size
+limits as the outer enforcement boundary.
+
+### `require_json_content_type`
+
+Set `require_json_content_type=True` with `body=` to reject non-empty bodies
+whose media type is neither `application/json` nor `application/*+json` with
+`415 Unsupported Media Type`. Matching is case-insensitive and ignores
+parameters such as `; charset=utf-8`.
+
+Empty bodies without `Content-Type` continue to the existing `422` missing-body
+path. A non-empty body without `Content-Type` receives `415`. The default
+`False` preserves the existing behavior of attempting JSON parsing regardless
+of the header.
+
 ### `query`
 
 Use `query=QueryModel` to validate query-string parameters.
+
+Query values arrive as strings. Keep normal Pydantic coercion for fields such
+as `page: int`; a model-wide `strict=True` rejects `?page=2`. You can still use
+`ConfigDict(extra="forbid")` to reject undeclared query keys. See
+[Strict API boundary models](strict-models.md).
 
 ```python
 class QueryModel(BaseModel):
@@ -152,6 +202,19 @@ def health(req: func.HttpRequest) -> dict[str, str]:
 
 Also supports generic type forms like `list[ResultModel]`.
 
+Validated response serialization can be customized with:
+
+- `response_by_alias=False` to emit Python field names instead of serialization aliases.
+- `response_exclude_none=True` to omit fields whose value is `None`.
+- `response_exclude_unset=True` to omit fields that were not explicitly set.
+
+These options require `response_model`; setting a non-default value without one
+raises `ValueError` when the decorator is created. They apply only after response
+validation. Returning `func.HttpResponse` still bypasses validation and
+serialization, so these options do not modify its body. `response_exclude_none`
+and `response_exclude_unset` affect payload presence only and do not change the
+declared response schema.
+
 Nested Pydantic models inside dataclass return values are serialized too, so a
 dataclass holding a `BaseModel` field renders as plain JSON rather than raising
 a serialization error.
@@ -181,6 +244,21 @@ def handler(req: func.HttpRequest, body: RequestModel) -> dict[str, str]:
 !!! note "Advanced extension point"
     Most projects should keep the default adapter.
 
+The complete method, lifetime, serialization, and exception contract is in
+[Writing a custom adapter](adapters.md), including the reusable public
+conformance suite.
+
+Custom adapters use an explicit exception contract for all four request parsing
+methods (`parse_body`, `parse_query`, `parse_path`, and `parse_headers`):
+
+- raise `MalformedRequestError` for syntactically malformed client input (`400`)
+- raise `AdapterValidationError` for model validation failures (`422`)
+- let every other exception propagate as an adapter fault (`500`, logged and sanitized)
+
+Plain `ValueError` is in the last category. There is no compatibility shim for
+the former `ValueError`-to-`400` behavior; custom adapters must migrate malformed
+syntax failures to `MalformedRequestError`.
+
 ### `error_formatter`
 
 `error_formatter` customizes error response payloads per handler.
@@ -190,10 +268,11 @@ from typing import Any
 
 
 def formatter(exc: Exception, status_code: int) -> dict[str, Any]:
+    message = str(exc) if status_code < 500 else "Internal Server Error"
     return {
         "error": {
             "code": f"VALIDATION_{status_code}",
-            "message": str(exc),
+            "message": message,
         }
     }
 
@@ -202,6 +281,16 @@ def formatter(exc: Exception, status_code: int) -> dict[str, Any]:
 def handler_custom(req: func.HttpRequest, body: RequestModel) -> dict[str, str]:
     return {"text": body.text}
 ```
+
+The formatter receives the original exception for 4xx responses. For 5xx
+responses it receives a public `InternalServerError` containing only
+`"Internal Server Error"`; the original is logged once with traceback.
+
+### `expose_internal_errors`
+
+`expose_internal_errors` defaults to `False`. Setting it to `True` passes the
+original 5xx exception to `error_formatter`, restoring the old behavior. This
+is unsafe because a formatter can expose internal details to clients.
 
 ### `status_code`
 
@@ -257,7 +346,8 @@ def create_custom(req: func.HttpRequest, body: RequestModel) -> ResultModel:
 
 - `adapter` defaults to `PydanticAdapter()`.
 - No `response_model` means output is serialized without response schema validation.
-- Returning `func.HttpResponse` bypasses response serialization/validation.
+- Returning `func.HttpResponse` bypasses response serialization/validation,
+  including all `response_*` serialization options.
 - 500-level internal pipeline errors are sanitized by default when no formatter is set.
 
 !!! tip "Choose explicit response models"
@@ -266,6 +356,7 @@ def create_custom(req: func.HttpRequest, body: RequestModel) -> ResultModel:
 
 ## Related references
 
+- [Strict API boundary models](strict-models.md)
 - [API Reference](api.md)
 - [Usage](usage.md)
 - [Troubleshooting](troubleshooting.md)

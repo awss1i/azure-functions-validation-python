@@ -4,11 +4,16 @@ This page documents the public API exported from `azure_functions_validation`.
 
 ```python
 from azure_functions_validation import (
+    AdapterConformanceTests,
+    AdapterValidationError,
     ErrorFormatter,
     HttpError,
+    MalformedRequestError,
+    PayloadTooLargeError,
     PydanticAdapter,
     ResponseValidationError,
     SerializationError,
+    UnsupportedMediaTypeError,
     ValidationAdapter,
     validate_http,
 )
@@ -16,13 +21,40 @@ from azure_functions_validation import (
 
 !!! note "Public surface"
     The package exports (`__all__`): `validate_http`, `ResponseValidationError`,
-    `SerializationError`, `ErrorFormatter`, `ValidationAdapter`, `PydanticAdapter`,
-    and `HttpError`. Pipeline internals (`PipelineConfig`, `run_pipeline`) are not
+    `SerializationError`, `MalformedRequestError`, `PayloadTooLargeError`,
+    `UnsupportedMediaTypeError`, `ErrorFormatter`,
+    `AdapterValidationError`, `ValidationAdapter`, `PydanticAdapter`,
+    `AdapterConformanceTests`, and `HttpError`. Pipeline internals
+    (`PipelineConfig`, `run_pipeline`) are not
     public contracts.
 
 ## `validate_http`
 
 ::: azure_functions_validation.validate_http
+
+| Response option | Default | Behavior |
+| --- | --- | --- |
+| `response_by_alias` | `True` | Use serialization aliases in validated response JSON and endpoint response metadata. |
+| `response_exclude_none` | `False` | Omit validated fields whose value is `None`. |
+| `response_exclude_unset` | `False` | Omit validated fields that were not explicitly set. |
+| `max_body_bytes` | `None` | Reject a configured body above this byte count with `413`. |
+| `require_json_content_type` | `False` | Require `application/json` or `application/*+json` for non-empty configured bodies; otherwise return `415`. |
+
+The response serialization options require `response_model`. Non-default values
+without a response model raise `ValueError` at decoration time. They do not apply
+when a handler returns `HttpResponse` directly; that path remains a full bypass.
+Exclusion options alter payload presence, not the emitted response schema.
+
+Body-policy failures are public typed exceptions:
+
+- `PayloadTooLargeError` maps to `413` with `loc=["body"]` and type
+  `payload_too_large`.
+- `UnsupportedMediaTypeError` maps to `415` with
+  `loc=["headers", "content-type"]` and type `unsupported_media_type`.
+
+Custom formatters receive these original exceptions because both are 4xx
+errors. Endpoint metadata remains unchanged and does not yet advertise the
+optional `413`/`415` responses.
 
 ### Usage example: body + response validation
 
@@ -242,10 +274,11 @@ class InputModel(BaseModel):
 
 
 def app_error_formatter(exc: Exception, status_code: int) -> dict[str, object]:
+    message = str(exc) if status_code < 500 else "Internal Server Error"
     return {
         "error": {
             "code": f"VALIDATION_{status_code}",
-            "message": str(exc),
+            "message": message,
         }
     }
 
@@ -264,6 +297,11 @@ def custom_error(req: func.HttpRequest, body: InputModel) -> dict[str, int]:
 
 !!! tip "Formatter signature"
     Keep the formatter signature exactly `(exc: Exception, status_code: int) -> dict[str, Any]`.
+
+For 4xx responses, the formatter receives the original exception. For 5xx
+responses, it receives `InternalServerError("Internal Server Error")` by default,
+while the original is logged server-side with traceback. The unsafe
+`expose_internal_errors=True` option restores original-exception passthrough.
 
 ## `HttpError`
 
@@ -331,9 +369,11 @@ misparsing new fields.
 
 Common status codes:
 
-- `400`: invalid JSON parsing (`"Invalid JSON"`).
+- `400`: an adapter raises `MalformedRequestError` for syntactically malformed
+  client input, including invalid JSON or UTF-8 (`"Invalid JSON"`).
 - `422`: request validation failed.
-- `500`: response validation failure or internal adapter failure.
+- `500`: request binding failure, response validation failure, or any unexpected
+  adapter exception, including a plain `ValueError`.
 
 !!! example "Typical loc values"
     - body errors: `loc` starts with `"body"`
@@ -354,6 +394,17 @@ Common status codes:
 implementation) are part of the public API. Pass a custom `adapter=` to
 `validate_http` to plug in a non-Pydantic validation backend; most deployments
 should keep the default `PydanticAdapter`.
+
+See [Writing a custom adapter](adapters.md) for every method's input, output,
+exception and content-type requirements, instance-reuse/thread-safety rules,
+formatter ordering, protocol versioning policy, and conformance-suite usage.
+
+Each `parse_body`, `parse_query`, `parse_path`, and `parse_headers` method must
+raise `MalformedRequestError` only for syntactically malformed client input
+(`400`) and `AdapterValidationError` for validation failures (`422`). Every
+other exception is treated as an adapter or server fault, logged with traceback,
+and returned as a sanitized `500`. This is intentionally breaking: a custom
+adapter's plain `ValueError` is no longer classified as a client error.
 
 ```python
 from azure_functions_validation import PydanticAdapter, ValidationAdapter, validate_http

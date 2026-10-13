@@ -153,7 +153,7 @@ jobs:
             --only-binary=:all: \
             --implementation cp \
             "azure-functions" \
-            "pydantic>=2.0,<3.0"
+            "pydantic>=2.11,<3.0"
           # Install local wheel last (overrides any PyPI version)
           pip install \
             --target examples/e2e_app/.python_packages/lib/site-packages \
